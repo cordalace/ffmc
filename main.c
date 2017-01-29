@@ -1,4 +1,5 @@
 #define FUSE_USE_VERSION 26
+#define FFMC_MAX_BUFFER_SIZE 1048576
 
 #include <stdio.h>
 #include <string.h>
@@ -7,10 +8,15 @@
 
 #include <fuse.h>
 #include <curl/curl.h>
+#include <pthread.h>
 
 static const char *video_path = "/big-buck-bunny.avi";
 static const char *big_buck_bunny_url = "https://velling.ru/media/big-buck-bunny.avi";
 static const long big_buck_bunny_len = 332243668L;
+static pthread_mutex_t mutex_buffer;
+static char buffer[FFMC_MAX_BUFFER_SIZE];
+static size_t buffer_offset = 0;
+static size_t buffer_size = 0;
 
 struct userdata_t {
     size_t len;
@@ -73,30 +79,64 @@ size_t write_callback(void *ptr, size_t size, size_t nmemb,
   return size * nmemb;
 }
 
+void download(size_t start)
+{
+    struct userdata_t curl_data;
+    CURL *curl;
+    size_t end;
+    char range_str[27];  // 1 TiB (13 chars) + "-" (1 char) + 1 TiB (13 chars)
+    if (start + FFMC_MAX_BUFFER_SIZE - 1 > big_buck_bunny_len) {
+        end = big_buck_bunny_len;
+    }
+    else {
+        end = start + FFMC_MAX_BUFFER_SIZE - 1;
+    }
+
+    curl_data.data = buffer;
+    curl_data.len = 0;
+    sprintf(range_str, "%zu-%zu", start, end);
+    curl = curl_easy_init();
+    curl_easy_setopt(curl, CURLOPT_URL, big_buck_bunny_url);
+    curl_easy_setopt(curl, CURLOPT_RANGE, range_str);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &curl_data);
+    curl_easy_perform(curl); /* ignores error */
+    buffer_offset = start;
+    buffer_size = end - start + 1;
+    curl_easy_cleanup(curl);
+}
+
+void cut_buffer(size_t offset, size_t size, char *buf)
+{
+    char *copy_start = buffer + offset - buffer_offset;
+    size_t move_bytes = buffer_size - offset + buffer_offset - size;
+    memcpy(buf, copy_start, size);
+    memmove(buffer, copy_start + size, move_bytes);
+    buffer_offset = offset + size;
+    buffer_size = move_bytes;
+}
+
 static int ffmc_read(const char *path, char *buf, size_t size, off_t offset,
                      struct fuse_file_info *fi)
 {
-    char range_str[27];  // 1 TiB (13 chars) + "-" (1 char) + 1 TiB (13 chars)
-    CURL *curl;
-    struct userdata_t curl_data;
     (void) fi;
+    int end;
+    int buffer_end;
 
     if(strcmp(path, video_path) != 0)
         return -ENOENT;
 
-    if (offset < big_buck_bunny_len) {
+    if ((offset < big_buck_bunny_len) && (size <= FFMC_MAX_BUFFER_SIZE)) {
         if (offset + size > big_buck_bunny_len)
             size = big_buck_bunny_len - offset;
-        curl_data.data = buf;
-        curl_data.len = 0;
-        sprintf(range_str, "%zu-%zu", offset, offset + size);
-        curl = curl_easy_init();
-        curl_easy_setopt(curl, CURLOPT_URL, big_buck_bunny_url);
-        curl_easy_setopt(curl, CURLOPT_RANGE, range_str);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &curl_data);
-        curl_easy_perform(curl); /* ignores error */
-        curl_easy_cleanup(curl);
+        end = offset + size;
+        pthread_mutex_lock(&mutex_buffer);
+        buffer_end = buffer_offset + buffer_size;
+        if ((offset < buffer_offset) || (end > buffer_end)) {
+            download(offset);
+        }
+        cut_buffer(offset, size, buf);
+        pthread_mutex_unlock(&mutex_buffer);
     } else
         size = 0;
 
@@ -112,6 +152,10 @@ static struct fuse_operations ffmc_oper = {
 
 int main(int argc, char *argv[])
 {
+    int ret = 0;
     curl_global_init(CURL_GLOBAL_ALL);
-    return fuse_main(argc, argv, &ffmc_oper, NULL);
+    pthread_mutex_init(&mutex_buffer, NULL);
+    ret = fuse_main(argc, argv, &ffmc_oper, NULL);
+    pthread_mutex_destroy(&mutex_buffer);
+    return ret;
 }
